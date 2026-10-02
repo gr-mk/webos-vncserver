@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.14)
-project (webos-vncserver C)
+project (webos-vncserver C CXX)
+
+# webOS NDK toolchain defaults to -Os, which makes compression and pixel
+# conversion several times slower
+add_compile_options(-O2)
 
 add_subdirectory(prebuilt)
 add_subdirectory(tv-native-apis)
@@ -43,9 +47,14 @@ add_executable(webos-vncserver
     src/settings.c
     src/uinput.c
     src/log.c
+    src/compositor.c
+    src/getauxval.c
 )
 set_property(TARGET webos-vncserver PROPERTY ENABLE_EXPORTS 1)
-target_link_libraries(webos-vncserver im vncserver pthread z png jpeg ssl crypto dl ${LS2_LDFLAGS} ${PBNJSON_LDFLAGS} ${GLIB2_LDFLAGS} ${PMLOG_LDFLAGS} rt)
+# libvncserver uses bundled zlib-ng and libdeflate, which are kept private to
+# it - other libraries keep using system zlib
+target_link_libraries(webos-vncserver im vncserver libdeflate zlibng pthread z png jpeg ssl crypto dl ${LS2_LDFLAGS} ${PBNJSON_LDFLAGS} ${GLIB2_LDFLAGS} ${PMLOG_LDFLAGS} rt m)
+target_link_options(webos-vncserver PRIVATE "-Wl,--exclude-libs,libz.a:libdeflate.a")
 
 set_target_properties(webos-vncserver PROPERTIES
     BUILD_RPATH_USE_ORIGIN ON
@@ -62,3 +71,14 @@ add_library(capture_halgal SHARED
     src/capture_halgal.c
 )
 target_link_libraries(capture_halgal halgal)
+
+add_library(capture_vtcapture SHARED
+    src/capture_vtcapture.cpp
+)
+target_link_libraries(capture_vtcapture vtcapture)
+
+add_library(capture_dile_vt SHARED
+    src/capture_dile_vt.c
+)
+# libdile_vt.so is missing DT_NEEDED for libPmLogLib.so.3
+target_link_libraries(capture_dile_vt dile_vt ${PMLOG_LDFLAGS})

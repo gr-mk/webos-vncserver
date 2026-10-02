@@ -1,0 +1,249 @@
+Pixel mode for level 1 compression
+
+Add libdeflate_deflate_compress_sync_pixels(), for 32-bit pixels: at level 1
+only whole pixels are matched - against the previous pixel, the pixel above,
+and the most recent pixel with the same hash, using a small table that isn't
+cleared for every call. On a TV streaming 4K video (1.4 GHz Cortex-A76) this
+compresses video frames to about the same size as level 1, ~1.6x faster.
+
+diff --git a/lib/deflate_compress.c b/lib/deflate_compress.c
+index f39b0f0..8a74fd3 100644
+--- a/lib/deflate_compress.c
++++ b/lib/deflate_compress.c
+@@ -107,6 +107,14 @@
+  */
+ #define FAST_SEQ_STORE_LENGTH	8192
+ 
++/*
++ * For deflate_compress_pixels(): log2 of the number of entries in the table of
++ * recent pixel positions.  A small table compresses slightly worse, but stays
++ * in L1 cache - which matters most when cores are shared with other work (on a
++ * TV streaming 4K video, 2^13 entries were ~35% faster than 2^15).
++ */
++#define PIXEL_HASH_ORDER	13
++
+ /*
+  * These are the maximum codeword lengths, in bits, the compressor will use for
+  * each Huffman code.  The DEFLATE format defines limits for these.  However,
+@@ -534,6 +542,12 @@ struct libdeflate_compressor {
+ 			struct deflate_sequence sequences[
+ 						FAST_SEQ_STORE_LENGTH + 1];
+ 
++			/*
++			 * Most recent position of each pixel hash, for
++			 * deflate_compress_pixels()
++			 */
++			u32 pixel_tab[1UL << PIXEL_HASH_ORDER];
++
+ 		} f; /* (f)astest */
+ 
+ 	#if SUPPORT_NEAR_OPTIMAL_PARSING
+@@ -2541,6 +2555,124 @@ deflate_compress_fastest(struct libdeflate_compressor * restrict c,
+ 	} while (in_next != in_end && !os->overflow);
+ }
+ 
++/*
++ * This is the "fastest" DEFLATE compressor for 32-bit pixels, in rows of
++ * 'stride' bytes.  Only whole pixels are matched - against the previous pixel,
++ * the pixel above, and the most recent pixel with the same hash.  This is
++ * faster than looking for matches at every byte, and compresses images about
++ * as well.
++ */
++static void
++deflate_compress_pixels(struct libdeflate_compressor * restrict c,
++			const u8 *in, size_t in_nbytes,
++			struct deflate_output_bitstream *os, size_t stride)
++{
++	const u8 *in_next = in;
++	const u8 *in_end = in_next + in_nbytes;
++	u32 * const pixel_tab = c->p.f.pixel_tab;
++
++	if (stride > DEFLATE_MAX_MATCH_OFFSET)
++		stride = 0;
++
++	do {
++		/* Starting a new DEFLATE block */
++
++		const u8 * const in_block_begin = in_next;
++		const u8 * const in_max_block_end = choose_max_block_end(
++				in_next, in_end, FAST_SOFT_MAX_BLOCK_LENGTH);
++		struct deflate_sequence *seq = c->p.f.sequences;
++
++		deflate_begin_sequences(c, seq);
++
++		do {
++			u32 pos = in_next - in;
++			size_t remaining = in_end - in_next;
++			u32 max_len;
++			u32 length = 0;
++			u32 offset = 0;
++			u32 pixel;
++			u32 hash;
++			u32 cand;
++
++			if (unlikely(remaining < 8)) {
++				/* Not worth matching the last pixel */
++				do {
++					deflate_choose_literal(c, *in_next++,
++							       false, seq);
++				} while (in_next != in_end);
++				break;
++			}
++
++			max_len = MIN(remaining, DEFLATE_MAX_MATCH_LEN) & ~3U;
++			pixel = load_u32_unaligned(in_next);
++
++			if (pos >= 4 &&
++			    pixel == load_u32_unaligned(in_next - 4)) {
++				length = lz_extend(in_next, in_next - 4, 4,
++						   max_len);
++				offset = 4;
++			}
++
++			if (stride && pos >= stride && length < max_len &&
++			    pixel == load_u32_unaligned(in_next - stride)) {
++				u32 len = lz_extend(in_next, in_next - stride,
++						    4, max_len);
++
++				if (len > length) {
++					length = len;
++					offset = stride;
++				}
++			}
++
++			/*
++			 * Entries left by previous calls are harmless, since
++			 * matches are verified.
++			 */
++			hash = lz_hash(pixel, PIXEL_HASH_ORDER);
++			cand = pixel_tab[hash];
++			pixel_tab[hash] = pos;
++			if (length < max_len && cand < pos &&
++			    pos - cand <= DEFLATE_MAX_MATCH_OFFSET &&
++			    pos - cand != offset &&
++			    pixel == load_u32_unaligned(in + cand)) {
++				u32 len = lz_extend(in_next, in + cand, 4,
++						    max_len);
++
++				if (len > length) {
++					length = len;
++					offset = pos - cand;
++				}
++			}
++
++			if (length) {
++				/* Match found - of whole pixels */
++				length &= ~3U;
++				deflate_choose_match(c, length, offset, false,
++						     &seq);
++				in_next += length;
++			} else {
++				/* No match found */
++				deflate_choose_literal(c, in_next[0], false,
++						       seq);
++				deflate_choose_literal(c, in_next[1], false,
++						       seq);
++				deflate_choose_literal(c, in_next[2], false,
++						       seq);
++				deflate_choose_literal(c, in_next[3], false,
++						       seq);
++				in_next += 4;
++			}
++
++			/* Check if it's time to output another block. */
++		} while (in_next < in_max_block_end &&
++			 seq < &c->p.f.sequences[FAST_SEQ_STORE_LENGTH]);
++
++		deflate_finish_block(c, os, in_block_begin,
++				     in_next - in_block_begin,
++				     c->p.f.sequences, in_next == in_end);
++	} while (in_next != in_end && !os->overflow);
++}
++
+ /*
+  * This is the "greedy" DEFLATE compressor. It always chooses the longest match.
+  */
+@@ -3952,6 +4084,7 @@ libdeflate_alloc_compressor_ex(int compression_level,
+ 		c->impl = deflate_compress_fastest;
+ 		/* max_search_depth is unused. */
+ 		c->nice_match_length = 32;
++		memset(c->p.f.pixel_tab, 0, sizeof(c->p.f.pixel_tab));
+ 		break;
+ 	case 2:
+ 		c->impl = deflate_compress_greedy;
+@@ -4049,7 +4182,8 @@ libdeflate_alloc_compressor(int compression_level)
+ static size_t
+ deflate_compress(struct libdeflate_compressor *c,
+ 		 const void *in, size_t in_nbytes,
+-		 void *out, size_t out_nbytes_avail, bool sync_flush)
++		 void *out, size_t out_nbytes_avail, bool sync_flush,
++		 size_t pixel_stride)
+ {
+ 	struct deflate_output_bitstream os;
+ 
+@@ -4070,7 +4204,10 @@ deflate_compress(struct libdeflate_compressor *c,
+ 	os.sync_flush = sync_flush;
+ 
+ 	/* Call the actual compression function. */
+-	(*c->impl)(c, in, in_nbytes, &os);
++	if (pixel_stride != 0 && c->impl == deflate_compress_fastest)
++		deflate_compress_pixels(c, in, in_nbytes, &os, pixel_stride);
++	else
++		(*c->impl)(c, in, in_nbytes, &os);
+ 
+ 	/* Return 0 if the output buffer is too small. */
+ 	if (os.overflow)
+@@ -4112,7 +4249,8 @@ libdeflate_deflate_compress(struct libdeflate_compressor *c,
+ 			    const void *in, size_t in_nbytes,
+ 			    void *out, size_t out_nbytes_avail)
+ {
+-	return deflate_compress(c, in, in_nbytes, out, out_nbytes_avail, false);
++	return deflate_compress(c, in, in_nbytes, out, out_nbytes_avail, false,
++				0);
+ }
+ 
+ LIBDEFLATEAPI size_t
+@@ -4120,7 +4258,18 @@ libdeflate_deflate_compress_sync(struct libdeflate_compressor *c,
+ 				 const void *in, size_t in_nbytes,
+ 				 void *out, size_t out_nbytes_avail)
+ {
+-	return deflate_compress(c, in, in_nbytes, out, out_nbytes_avail, true);
++	return deflate_compress(c, in, in_nbytes, out, out_nbytes_avail, true,
++				0);
++}
++
++LIBDEFLATEAPI size_t
++libdeflate_deflate_compress_sync_pixels(struct libdeflate_compressor *c,
++					const void *in, size_t in_nbytes,
++					void *out, size_t out_nbytes_avail,
++					size_t stride)
++{
++	return deflate_compress(c, in, in_nbytes, out, out_nbytes_avail, true,
++				stride);
+ }
+ 
+ LIBDEFLATEAPI void
+diff --git a/libdeflate.h b/libdeflate.h
+index 199089d..983270a 100644
+--- a/libdeflate.h
++++ b/libdeflate.h
+@@ -133,6 +133,19 @@ libdeflate_deflate_compress_sync(struct libdeflate_compressor *compressor,
+ 				 const void *in, size_t in_nbytes,
+ 				 void *out, size_t out_nbytes_avail);
+ 
++/*
++ * Like libdeflate_deflate_compress_sync(), but for 32-bit pixels, in rows of
++ * 'stride' bytes.  At compression level 1, only whole pixels are matched -
++ * against the previous pixel, the pixel above and a recent pixel of the same
++ * value - which is faster, and compresses images about as well.  Other levels
++ * compress as usual.
++ */
++LIBDEFLATEAPI size_t
++libdeflate_deflate_compress_sync_pixels(struct libdeflate_compressor *compressor,
++					const void *in, size_t in_nbytes,
++					void *out, size_t out_nbytes_avail,
++					size_t stride);
++
+ /*
+  * Like libdeflate_deflate_compress(), but uses the zlib wrapper format instead
+  * of raw DEFLATE.

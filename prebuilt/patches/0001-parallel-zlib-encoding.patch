@@ -1,0 +1,702 @@
+Parallel zlib encoding
+
+Compress zlib rectangle strips independently (raw deflate, reset for every
+strip) in multiple threads, sending them in order as soon as they're ready.
+Independently compressed strips ending with a sync flush form a valid
+continuation of the client's zlib stream - zlib header is sent once per
+client. Strips are compressed directly from framebuffer if no pixel format
+translation is needed.
+
+Strips are compressed with libdeflate (patched to end its output with a sync
+flush, and with a faster mode for 32-bit pixels), if the CPU supports NEON -
+it compresses video as well as zlib-ng level 2 in a third of the time.
+
+diff --git a/libvncserver/rfbserver.c b/libvncserver/rfbserver.c
+index 67ffcbcf..a0695825 100644
+--- a/libvncserver/rfbserver.c
++++ b/libvncserver/rfbserver.c
+@@ -449,6 +449,7 @@ rfbNewTCPOrUDPClient(rfbScreenInfoPtr rfbScreen,
+ 
+ #ifdef LIBVNCSERVER_HAVE_LIBZ
+       cl->compStreamInited = FALSE;
++      cl->zlibHeaderSent = FALSE;
+       cl->compStream.total_in = 0;
+       cl->compStream.total_out = 0;
+       cl->compStream.zalloc = Z_NULL;
+diff --git a/libvncserver/zlib.c b/libvncserver/zlib.c
+index 5c3a8236..4e2c4c86 100644
+--- a/libvncserver/zlib.c
++++ b/libvncserver/zlib.c
+@@ -2,6 +2,20 @@
+  * zlib.c
+  *
+  * Routines to implement zlib based encoding (deflate).
++ *
++ * Rectangles are split into strips, which are compressed in parallel by
++ * multiple threads, each strip independently of previous data (raw deflate
++ * stream reset for every strip), and then sent in order. Since every strip
++ * ends with a sync flush, the strips form a valid continuation of the client's
++ * single zlib stream - zlib header is sent once, with the first zlib
++ * rectangle, and the stream is never finished, so its checksum is never
++ * verified by clients.
++ *
++ * Strips are compressed with libdeflate (patched to end its output with a
++ * sync flush) if the CPU supports NEON, which libdeflate is built with.
++ * libdeflate level 1, in its (patched in) mode for 32-bit pixels, compresses
++ * video about as well as zlib-ng level 2, in a third of the time. Otherwise
++ * zlib is used.
+  */
+ 
+ /*
+@@ -31,247 +45,302 @@
+  */
+ 
+ #include <rfb/rfb.h>
++#include <pthread.h>
++#include <sys/auxv.h>
++#include <libdeflate.h>
++
++/* Threads compressing strips of a single rectangle - more don't pay off, as
++ * deflate gets memory bound (on a 4-core TV, 3 threads were slower than 2) */
++#define ZLIB_MAX_THREADS 2
++/* Maximum number of compressed strips waiting to be sent */
++#define ZLIB_MAX_PENDING 16
++
++/* zlib stream header - deflate, 32K window, fastest compression */
++static const char zlibStreamHeader[2] = { 0x78, 0x01 };
++
++typedef struct {
++    int y;
++    int h;
++    char *data;
++    int len;
++    /* 0 - pending, 1 - compressed, 2 - to be sent raw, -1 - failed */
++    int state;
++} rfbZlibStrip;
++
++typedef struct {
++    rfbClientPtr cl;
++    int x;
++    int w;
++    rfbZlibStrip *strips;
++    int nStrips;
++    int nextStrip;
++    int sentStrips;
++    rfbBool failed;
++    rfbBool useLibdeflate;
++    pthread_mutex_t mutex;
++    pthread_cond_t cond;
++} rfbZlibJob;
+ 
+-/*
+- * zlibBeforeBuf contains pixel data in the client's format.
+- * zlibAfterBuf contains the zlib (deflated) encoding version.
+- * If the zlib compressed/encoded version is
+- * larger than the raw data or if it exceeds zlibAfterBufSize then
+- * raw encoding is used instead.
+- */
++void rfbZlibCleanup(rfbScreenInfoPtr screen)
++{
++}
++
++static rfbBool
++rfbZlibUseLibdeflate(void)
++{
++    static int useLibdeflate = -1;
++
++    if (useLibdeflate < 0)
++        useLibdeflate = (getauxval(AT_HWCAP) & HWCAP_ARM_NEON) != 0;
++
++    return useLibdeflate;
++}
+ 
+ /*
+- * Out of lazyiness, we use thread local storage for zlib as we did for
+- * tight.  N.B. ZRLE does it the traditional way with per-client storage
+- * (and so at least ZRLE will work threaded on older systems.)
++ * libdeflate compresses better than zlib at the same level - level 1 already
++ * beats zlib level 2, so levels are shifted down by one.
+  */
+-#if defined(__GNUC__)
+-#define TLS __thread
+-#elif defined(_MSC_VER)
+-#define TLS __declspec(thread)
+-#else
+-#define TLS
+-#endif
++static struct libdeflate_compressor *
++rfbZlibAllocLibdeflate(rfbClientPtr cl)
++{
++    int level = cl->zlibCompressLevel;
+ 
+-static TLS int zlibBeforeBufSize = 0;
+-static TLS char *zlibBeforeBuf = NULL;
++    if (level > 2)
++        level--;
++    else if (level > 0)
++        level = 1;
+ 
+-static TLS int zlibAfterBufSize = 0;
+-static TLS char *zlibAfterBuf = NULL;
+-static TLS int zlibAfterBufLen = 0;
++    return libdeflate_alloc_compressor(level);
++}
+ 
+-void rfbZlibCleanup(rfbScreenInfoPtr screen)
++static rfbBool
++rfbZlibInitStream(rfbClientPtr cl, z_stream *stream)
+ {
+-  if (zlibBeforeBufSize) {
+-    free(zlibBeforeBuf);
+-    zlibBeforeBuf = NULL;
+-    zlibBeforeBufSize=0;
+-  }
+-  if (zlibAfterBufSize) {
+-    zlibAfterBufSize=0;
+-    free(zlibAfterBuf);
+-    zlibAfterBuf = NULL;
+-  }
++    memset(stream, 0, sizeof(*stream));
++    /* Raw deflate - zlib header is sent separately, once per client */
++    return deflateInit2(stream, cl->zlibCompressLevel, Z_DEFLATED,
++                        -MAX_WBITS, 8, Z_DEFAULT_STRATEGY) == Z_OK;
+ }
+ 
+-
+ /*
+- * rfbSendOneRectEncodingZlib - send a given rectangle using one Zlib
+- *                              rectangle encoding.
++ * Converts strip pixels to client format and compresses them, independently
++ * of any previously compressed data - with deflater if given, otherwise with
++ * stream.
+  */
+-
+-static rfbBool
+-rfbSendOneRectEncodingZlib(rfbClientPtr cl,
+-                           int x,
+-                           int y,
+-                           int w,
+-                           int h)
++static int
++rfbZlibCompressStrip(rfbClientPtr cl, z_stream *stream,
++                     struct libdeflate_compressor *deflater, int x, int w,
++                     rfbZlibStrip *strip, char **rawBuf, size_t *rawBufSize)
+ {
+-    rfbFramebufferUpdateRectHeader rect;
+-    rfbZlibHeader hdr;
+-    int deflateResult;
+-    int previousOut;
+-    int i;
+-    char *fbptr = (cl->scaledScreen->frameBuffer + (cl->scaledScreen->paddedWidthInBytes * y)
+-    	   + (x * (cl->scaledScreen->bitsPerPixel / 8)));
+-
+-    int maxRawSize;
+-    int maxCompSize;
+-
+-    maxRawSize = (cl->scaledScreen->width * cl->scaledScreen->height
+-                  * (cl->format.bitsPerPixel / 8));
+-
+-    if (!zlibBeforeBuf || zlibBeforeBufSize < maxRawSize) {
+-        if (zlibBeforeBuf == NULL)
+-            zlibBeforeBuf = (char *)malloc(maxRawSize);
+-        else {
+-            char *reallocedBeforeEncBuf = (char *)realloc(zlibBeforeBuf, maxRawSize);
+-            if (!reallocedBeforeEncBuf) return FALSE;
+-            zlibBeforeBuf = reallocedBeforeEncBuf;
++    size_t rawSize = (size_t)w * strip->h * (cl->format.bitsPerPixel / 8);
++    char *fbptr = (cl->scaledScreen->frameBuffer
++                   + (cl->scaledScreen->paddedWidthInBytes * strip->y)
++                   + (x * (cl->scaledScreen->bitsPerPixel / 8)));
++    char *input;
++    uLong maxSize;
++
++    /* zlib compression is not useful for very small data sets. */
++    if (rawSize < VNC_ENCODE_ZLIB_MIN_COMP_SIZE)
++        return 2;
++
++    if (cl->translateFn == rfbTranslateNone
++        && (size_t)w * (cl->format.bitsPerPixel / 8) == (size_t)cl->scaledScreen->paddedWidthInBytes) {
++        /* Same pixel format, full-width strip - compress framebuffer directly */
++        input = fbptr;
++    } else {
++        if (*rawBufSize < rawSize) {
++            char *buf = (char *)realloc(*rawBuf, rawSize);
++            if (!buf)
++                return -1;
++            *rawBuf = buf;
++            *rawBufSize = rawSize;
+         }
+-        if(zlibBeforeBuf)
+-            zlibBeforeBufSize = maxRawSize;
++
++        (*cl->translateFn)(cl->translateLookupTable, &cl->screen->serverFormat,
++                           &cl->format, fbptr, *rawBuf,
++                           cl->scaledScreen->paddedWidthInBytes, w, strip->h);
++        input = *rawBuf;
+     }
+ 
+-    /* zlib compression is not useful for very small data sets.
+-     * So, we just send these raw without any compression.
+-     */
+-    if (( w * h * (cl->scaledScreen->bitsPerPixel / 8)) <
+-          VNC_ENCODE_ZLIB_MIN_COMP_SIZE ) {
++    if (deflater) {
++        /* Sync flush adds up to 5 bytes of empty stored block */
++        size_t bound = libdeflate_deflate_compress_bound(deflater, rawSize) + 5;
+ 
+-        int result;
++        strip->data = (char *)malloc(bound);
++        if (!strip->data)
++            return -1;
+ 
+-        /* The translation function (used also by the in raw encoding)
+-         * requires 4/2/1 byte alignment in the output buffer (which is
+-         * updateBuf for the raw encoding) based on the bitsPerPixel of
+-         * the viewer/client.  This prevents SIGBUS errors on some
+-         * architectures like SPARC, PARISC...
+-         */
+-        if (( cl->format.bitsPerPixel > 8 ) &&
+-            ( cl->ublen % ( cl->format.bitsPerPixel / 8 )) != 0 ) {
+-            if (!rfbSendUpdateBuf(cl))
+-                return FALSE;
++        if (cl->format.bitsPerPixel == 32)
++            strip->len = libdeflate_deflate_compress_sync_pixels(deflater, input, rawSize,
++                                                                 strip->data, bound, (size_t)w * 4);
++        else
++            strip->len = libdeflate_deflate_compress_sync(deflater, input, rawSize,
++                                                          strip->data, bound);
++        if (strip->len == 0) {
++            free(strip->data);
++            strip->data = NULL;
++            return -1;
+         }
+ 
+-        result = rfbSendRectEncodingRaw(cl, x, y, w, h);
++        return 1;
++    }
+ 
+-        return result;
++    deflateReset(stream);
+ 
+-    }
++    /* Sync flush adds up to 5 bytes of empty stored block */
++    maxSize = deflateBound(stream, rawSize) + 16;
++    strip->data = (char *)malloc(maxSize);
++    if (!strip->data)
++        return -1;
+ 
+-    /*
+-     * zlib requires output buffer to be slightly larger than the input
+-     * buffer, in the worst case.
+-     */
+-    maxCompSize = maxRawSize + (( maxRawSize + 99 ) / 100 ) + 12;
+-
+-    if (!zlibAfterBuf || zlibAfterBufSize < maxCompSize) {
+-        if (zlibAfterBuf == NULL)
+-            zlibAfterBuf = (char *)malloc(maxCompSize);
+-        else {
+-            char *reallocedAfterEncBuf = (char *)realloc(zlibAfterBuf, maxCompSize);
+-            if (!reallocedAfterEncBuf) return FALSE;
+-            zlibAfterBuf = reallocedAfterEncBuf;
+-        }
+-        if(zlibAfterBuf)
+-            zlibAfterBufSize = maxCompSize;
++    stream->next_in = (Bytef *)input;
++    stream->avail_in = rawSize;
++    stream->next_out = (Bytef *)strip->data;
++    stream->avail_out = maxSize;
++    stream->data_type = Z_BINARY;
++
++    if (deflate(stream, Z_SYNC_FLUSH) != Z_OK || stream->avail_in != 0 || stream->avail_out == 0) {
++        free(strip->data);
++        strip->data = NULL;
++        return -1;
+     }
+ 
+-    if (!zlibBeforeBuf || !zlibAfterBuf)
+-    {
+-        rfbLog("rfbSendOneRectEncodingZlib: failed to allocate memory\n");
+-        return FALSE;
++    strip->len = maxSize - stream->avail_out;
++    return 1;
++}
++
++static void *
++rfbZlibWorker(void *arg)
++{
++    rfbZlibJob *job = (rfbZlibJob *)arg;
++    z_stream stream;
++    struct libdeflate_compressor *deflater = NULL;
++    char *rawBuf = NULL;
++    size_t rawBufSize = 0;
++    rfbBool inited;
++
++    if (job->useLibdeflate) {
++        deflater = rfbZlibAllocLibdeflate(job->cl);
++        inited = deflater != NULL;
++    } else {
++        inited = rfbZlibInitStream(job->cl, &stream);
+     }
+ 
+-    /* 
+-     * Convert pixel data to client format.
+-     */
+-    (*cl->translateFn)(cl->translateLookupTable, &cl->screen->serverFormat,
+-		       &cl->format, fbptr, zlibBeforeBuf,
+-		       cl->scaledScreen->paddedWidthInBytes, w, h);
+-
+-    cl->compStream.next_in = ( Bytef * )zlibBeforeBuf;
+-    cl->compStream.avail_in = w * h * (cl->format.bitsPerPixel / 8);
+-    cl->compStream.next_out = ( Bytef * )zlibAfterBuf;
+-    cl->compStream.avail_out = maxCompSize;
+-    cl->compStream.data_type = Z_BINARY;
+-
+-    /* Initialize the deflation state. */
+-    if ( cl->compStreamInited == FALSE ) {
+-
+-        cl->compStream.total_in = 0;
+-        cl->compStream.total_out = 0;
+-        cl->compStream.zalloc = Z_NULL;
+-        cl->compStream.zfree = Z_NULL;
+-        cl->compStream.opaque = Z_NULL;
+-
+-        deflateInit2( &(cl->compStream),
+-                        cl->zlibCompressLevel,
+-                        Z_DEFLATED,
+-                        MAX_WBITS,
+-                        MAX_MEM_LEVEL,
+-                        Z_DEFAULT_STRATEGY );
+-        /* deflateInit( &(cl->compStream), Z_BEST_COMPRESSION ); */
+-        /* deflateInit( &(cl->compStream), Z_BEST_SPEED ); */
+-        cl->compStreamInited = TRUE;
++    for (;;) {
++        rfbZlibStrip *strip;
++        int state;
++
++        pthread_mutex_lock(&job->mutex);
++        if (!inited)
++            job->failed = TRUE;
++        while (!job->failed && job->nextStrip < job->nStrips
++               && job->nextStrip - job->sentStrips >= ZLIB_MAX_PENDING)
++            pthread_cond_wait(&job->cond, &job->mutex);
++        if (job->failed || job->nextStrip >= job->nStrips) {
++            pthread_cond_broadcast(&job->cond);
++            pthread_mutex_unlock(&job->mutex);
++            break;
++        }
++        strip = &job->strips[job->nextStrip++];
++        pthread_mutex_unlock(&job->mutex);
+ 
++        state = rfbZlibCompressStrip(job->cl, &stream, deflater, job->x, job->w, strip, &rawBuf, &rawBufSize);
++
++        pthread_mutex_lock(&job->mutex);
++        strip->state = state;
++        if (state < 0)
++            job->failed = TRUE;
++        pthread_cond_broadcast(&job->cond);
++        pthread_mutex_unlock(&job->mutex);
+     }
+ 
+-    previousOut = cl->compStream.total_out;
++    if (deflater)
++        libdeflate_free_compressor(deflater);
++    else if (inited)
++        deflateEnd(&stream);
++    free(rawBuf);
+ 
+-    /* Perform the compression here. */
+-    deflateResult = deflate( &(cl->compStream), Z_SYNC_FLUSH );
++    return NULL;
++}
+ 
+-    /* Find the total size of the resulting compressed data. */
+-    zlibAfterBufLen = cl->compStream.total_out - previousOut;
++static rfbBool
++rfbZlibSendStrip(rfbClientPtr cl, int x, int w, rfbZlibStrip *strip)
++{
++    rfbFramebufferUpdateRectHeader rect;
++    rfbZlibHeader hdr;
++    int headerLen = cl->zlibHeaderSent ? 0 : sizeof(zlibStreamHeader);
++    int i;
+ 
+-    if ( deflateResult != Z_OK ) {
+-        rfbErr("zlib deflation error: %s\n", cl->compStream.msg);
+-        return FALSE;
+-    }
++    if (strip->state == 2) {
++        /* The translation function (used also by the in raw encoding)
++         * requires 4/2/1 byte alignment in the output buffer (which is
++         * updateBuf for the raw encoding) based on the bitsPerPixel of
++         * the viewer/client.  This prevents SIGBUS errors on some
++         * architectures like SPARC, PARISC...
++         */
++        if (( cl->format.bitsPerPixel > 8 ) &&
++            ( cl->ublen % ( cl->format.bitsPerPixel / 8 )) != 0 ) {
++            if (!rfbSendUpdateBuf(cl))
++                return FALSE;
++        }
+ 
+-    /* Note that it is not possible to switch zlib parameters based on
+-     * the results of the compression pass.  The reason is
+-     * that we rely on the compressor and decompressor states being
+-     * in sync.  Compressing and then discarding the results would
+-     * cause lose of synchronization.
+-     */
++        return rfbSendRectEncodingRaw(cl, x, strip->y, w, strip->h);
++    }
+ 
+-    /* Update statics */
+-    rfbStatRecordEncodingSent(cl, rfbEncodingZlib, sz_rfbFramebufferUpdateRectHeader + sz_rfbZlibHeader + zlibAfterBufLen,
+-        + w * (cl->format.bitsPerPixel / 8) * h);
++    rfbStatRecordEncodingSent(cl, rfbEncodingZlib,
++        sz_rfbFramebufferUpdateRectHeader + sz_rfbZlibHeader + headerLen + strip->len,
++        w * (cl->format.bitsPerPixel / 8) * strip->h);
+ 
+     if (cl->ublen + sz_rfbFramebufferUpdateRectHeader + sz_rfbZlibHeader
+-	> UPDATE_BUF_SIZE)
++        + headerLen > UPDATE_BUF_SIZE)
+     {
+-	if (!rfbSendUpdateBuf(cl))
+-	    return FALSE;
++        if (!rfbSendUpdateBuf(cl))
++            return FALSE;
+     }
+ 
+     rect.r.x = Swap16IfLE(x);
+-    rect.r.y = Swap16IfLE(y);
++    rect.r.y = Swap16IfLE(strip->y);
+     rect.r.w = Swap16IfLE(w);
+-    rect.r.h = Swap16IfLE(h);
++    rect.r.h = Swap16IfLE(strip->h);
+     rect.encoding = Swap32IfLE(rfbEncodingZlib);
+ 
+     memcpy(&cl->updateBuf[cl->ublen], (char *)&rect,
+-	   sz_rfbFramebufferUpdateRectHeader);
++           sz_rfbFramebufferUpdateRectHeader);
+     cl->ublen += sz_rfbFramebufferUpdateRectHeader;
+ 
+-    hdr.nBytes = Swap32IfLE(zlibAfterBufLen);
++    hdr.nBytes = Swap32IfLE(headerLen + strip->len);
+ 
+     memcpy(&cl->updateBuf[cl->ublen], (char *)&hdr, sz_rfbZlibHeader);
+     cl->ublen += sz_rfbZlibHeader;
+ 
+-    for (i = 0; i < zlibAfterBufLen;) {
++    if (headerLen) {
++        memcpy(&cl->updateBuf[cl->ublen], zlibStreamHeader, headerLen);
++        cl->ublen += headerLen;
++        cl->zlibHeaderSent = TRUE;
++    }
+ 
+-	int bytesToCopy = UPDATE_BUF_SIZE - cl->ublen;
++    for (i = 0; i < strip->len;) {
+ 
+-	if (i + bytesToCopy > zlibAfterBufLen) {
+-	    bytesToCopy = zlibAfterBufLen - i;
+-	}
++        int bytesToCopy = UPDATE_BUF_SIZE - cl->ublen;
+ 
+-	memcpy(&cl->updateBuf[cl->ublen], &zlibAfterBuf[i], bytesToCopy);
++        if (i + bytesToCopy > strip->len) {
++            bytesToCopy = strip->len - i;
++        }
++
++        memcpy(&cl->updateBuf[cl->ublen], &strip->data[i], bytesToCopy);
+ 
+-	cl->ublen += bytesToCopy;
+-	i += bytesToCopy;
++        cl->ublen += bytesToCopy;
++        i += bytesToCopy;
+ 
+-	if (cl->ublen == UPDATE_BUF_SIZE) {
+-	    if (!rfbSendUpdateBuf(cl))
+-		return FALSE;
+-	}
++        if (cl->ublen == UPDATE_BUF_SIZE) {
++            if (!rfbSendUpdateBuf(cl))
++                return FALSE;
++        }
+     }
+ 
+     return TRUE;
+-
+ }
+ 
+-
+-/*
+- * rfbSendRectEncodingZlib - send a given rectangle using one or more
+- *                           Zlib encoding rectangles.
+- */
+-
+ rfbBool
+ rfbSendRectEncodingZlib(rfbClientPtr cl,
+                         int x,
+@@ -279,69 +348,106 @@ rfbSendRectEncodingZlib(rfbClientPtr cl,
+                         int w,
+                         int h)
+ {
+-    int  maxLines;
+-    int  linesRemaining;
+-    rfbRectangle partialRect;
++    /* Strip size has to match rectangle count calculated in
++     * rfbSendFramebufferUpdate */
++    int maxLines = ( ZLIB_MAX_SIZE(w) / w );
++    int nStrips = ( (h - 1) / maxLines ) + 1;
++    rfbZlibJob job;
++    pthread_t threads[ZLIB_MAX_THREADS];
++    int nThreads = 0;
++    rfbBool result = TRUE;
++    int i;
+ 
+-    partialRect.x = x;
+-    partialRect.y = y;
+-    partialRect.w = w;
+-    partialRect.h = h;
++    memset(&job, 0, sizeof(job));
++    job.cl = cl;
++    job.x = x;
++    job.w = w;
++    job.nStrips = nStrips;
++    job.useLibdeflate = rfbZlibUseLibdeflate();
++    job.strips = (rfbZlibStrip *)calloc(nStrips, sizeof(rfbZlibStrip));
++    if (!job.strips)
++        return FALSE;
+ 
+-    /* Determine maximum pixel/scan lines allowed per rectangle. */
+-    maxLines = ( ZLIB_MAX_SIZE(w) / w );
++    for (i = 0; i < nStrips; i++) {
++        job.strips[i].y = y + i * maxLines;
++        job.strips[i].h = (i == nStrips - 1) ? h - i * maxLines : maxLines;
++    }
+ 
+-    /* Initialize number of scan lines left to do. */
+-    linesRemaining = h;
++    if (nStrips == 1) {
++        /* Not worth spawning threads for a single strip */
++        char *rawBuf = NULL;
++        size_t rawBufSize = 0;
+ 
+-    /* Loop until all work is done. */
+-    while ( linesRemaining > 0 ) {
++        if (!cl->compStreamInited) {
++            if (!rfbZlibInitStream(cl, &cl->compStream)) {
++                free(job.strips);
++                return FALSE;
++            }
++            cl->compStreamInited = TRUE;
++        }
+ 
+-        int linesToComp;
++        job.strips[0].state = rfbZlibCompressStrip(cl, &cl->compStream, NULL, x, w, &job.strips[0], &rawBuf, &rawBufSize);
++        result = job.strips[0].state > 0 && rfbZlibSendStrip(cl, x, w, &job.strips[0]);
++        free(job.strips[0].data);
++        free(job.strips);
++        free(rawBuf);
+ 
+-        if ( maxLines < linesRemaining )
+-            linesToComp = maxLines;
+-        else
+-            linesToComp = linesRemaining;
++        if (!result)
++            rfbErr("zlib encoding failed\n");
+ 
+-        partialRect.h = linesToComp;
++        return result;
++    }
+ 
+-        /* Encode (compress) and send the next rectangle. */
+-        if ( ! rfbSendOneRectEncodingZlib( cl,
+-                                           partialRect.x,
+-                                           partialRect.y,
+-                                           partialRect.w,
+-                                           partialRect.h )) {
++    pthread_mutex_init(&job.mutex, NULL);
++    pthread_cond_init(&job.cond, NULL);
+ 
+-            return FALSE;
+-        }
++    for (i = 0; i < ZLIB_MAX_THREADS && i < nStrips; i++) {
++        if (pthread_create(&threads[nThreads], NULL, rfbZlibWorker, &job) == 0)
++            nThreads++;
++    }
+ 
+-        /* Technically, flushing the buffer here is not extremely
+-         * efficient.  However, this improves the overall throughput
+-         * of the system over very slow networks.  By flushing
+-         * the buffer with every maximum size zlib rectangle, we
+-         * improve the pipelining usage of the server CPU, network,
+-         * and viewer CPU components.  Insuring that these components
+-         * are working in parallel actually improves the performance
+-         * seen by the user.
+-         * Since, zlib is most useful for slow networks, this flush
+-         * is appropriate for the desired behavior of the zlib encoding.
+-         */
+-        if (( cl->ublen > 0 ) &&
+-            ( linesToComp == maxLines )) {
+-            if (!rfbSendUpdateBuf(cl)) {
++    if (nThreads == 0) {
++        rfbErr("zlib encoding: failed to start compression threads\n");
++        result = FALSE;
++    }
+ 
+-                return FALSE;
+-            }
+-        }
++    /* Send strips in order as soon as they're compressed */
++    for (i = 0; result && i < nStrips; i++) {
++        rfbZlibStrip *strip = &job.strips[i];
++
++        pthread_mutex_lock(&job.mutex);
++        while (strip->state == 0 && !job.failed)
++            pthread_cond_wait(&job.cond, &job.mutex);
++        result = strip->state > 0;
++        pthread_mutex_unlock(&job.mutex);
+ 
+-        /* Update remaining and incremental rectangle location. */
+-        linesRemaining -= linesToComp;
+-        partialRect.y += linesToComp;
++        if (result)
++            result = rfbZlibSendStrip(cl, x, w, strip);
+ 
++        free(strip->data);
++        strip->data = NULL;
++
++        pthread_mutex_lock(&job.mutex);
++        job.sentStrips++;
++        if (!result)
++            job.failed = TRUE;
++        pthread_cond_broadcast(&job.cond);
++        pthread_mutex_unlock(&job.mutex);
+     }
+ 
+-    return TRUE;
++    for (i = 0; i < nThreads; i++)
++        pthread_join(threads[i], NULL);
+ 
+-}
++    /* Strips compressed but not sent due to a failure */
++    for (i = 0; i < nStrips; i++)
++        free(job.strips[i].data);
+ 
++    pthread_mutex_destroy(&job.mutex);
++    pthread_cond_destroy(&job.cond);
++    free(job.strips);
++
++    if (!result)
++        rfbErr("zlib encoding failed\n");
++
++    return result;
++}
+diff --git a/rfb/rfb.h b/rfb/rfb.h
+index 4f275fc8..eff0bb9f 100644
+--- a/rfb/rfb.h
++++ b/rfb/rfb.h
+@@ -698,6 +698,8 @@ typedef struct _rfbClientRec {
+     uint32_t extClipboardMaxUnsolicitedSize;
+     char *extClipboardData;
+     int extClipboardDataSize;
++    /** zlib stream header has been sent (parallel zlib encoding) */
++    rfbBool zlibHeaderSent;
+ #endif
+ } rfbClientRec, *rfbClientPtr;
+ 

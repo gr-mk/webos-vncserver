@@ -1,0 +1,192 @@
+Sync flush
+
+Add libdeflate_deflate_compress_sync(), which ends its output like zlib's
+deflate() with Z_SYNC_FLUSH (no final block, empty stored block), so that
+independently compressed pieces can be concatenated into one stream.
+
+diff --git a/lib/deflate_compress.c b/lib/deflate_compress.c
+index b24087c..f39b0f0 100644
+--- a/lib/deflate_compress.c
++++ b/lib/deflate_compress.c
+@@ -707,6 +707,12 @@ struct deflate_output_bitstream {
+ 
+ 	/* true if the output buffer ran out of space */
+ 	bool overflow;
++
++	/*
++	 * true if no block may be marked final, as the output will be ended
++	 * with a sync flush (see libdeflate_deflate_compress_sync())
++	 */
++	bool sync_flush;
+ };
+ 
+ /*
+@@ -1744,6 +1750,9 @@ deflate_flush_block(struct libdeflate_compressor *c,
+ 	ASSERT(out_next <= os->end);
+ 	ASSERT(!os->overflow);
+ 
++	if (os->sync_flush)
++		is_final_block = false;
++
+ 	/* Precompute the precode items and build the precode. */
+ 	deflate_precompute_huffman_header(c);
+ 
+@@ -2388,10 +2397,11 @@ choose_max_block_end(const u8 *in_block_begin, const u8 *in_end,
+ 
+ /*
+  * This is the level 0 "compressor".  It always outputs uncompressed blocks.
++ * If sync_flush is true, then no block is final and an empty block is added.
+  */
+ static size_t
+ deflate_compress_none(const u8 *in, size_t in_nbytes,
+-		      u8 *out, size_t out_nbytes_avail)
++		      u8 *out, size_t out_nbytes_avail, bool sync_flush)
+ {
+ 	const u8 *in_next = in;
+ 	const u8 * const in_end = in + in_nbytes;
+@@ -2402,12 +2412,13 @@ deflate_compress_none(const u8 *in, size_t in_nbytes,
+ 	 * If the input is zero-length, we still must output a block in order
+ 	 * for the output to be a valid DEFLATE stream.  Handle this case
+ 	 * specially to avoid potentially passing NULL to memcpy() below.
++	 * With sync_flush, this empty non-final block is the whole output.
+ 	 */
+ 	if (unlikely(in_nbytes == 0)) {
+ 		if (out_nbytes_avail < 5)
+ 			return 0;
+ 		/* BFINAL and BTYPE */
+-		*out_next++ = 1 | (DEFLATE_BLOCKTYPE_UNCOMPRESSED << 1);
++		*out_next++ = !sync_flush | (DEFLATE_BLOCKTYPE_UNCOMPRESSED << 1);
+ 		/* LEN and NLEN */
+ 		put_unaligned_le32(0xFFFF0000, out_next);
+ 		return 5;
+@@ -2418,7 +2429,7 @@ deflate_compress_none(const u8 *in, size_t in_nbytes,
+ 		size_t len = UINT16_MAX;
+ 
+ 		if (in_end - in_next <= UINT16_MAX) {
+-			bfinal = 1;
++			bfinal = !sync_flush;
+ 			len = in_end - in_next;
+ 		}
+ 		if (out_end - out_next < 5 + len)
+@@ -2439,6 +2450,14 @@ deflate_compress_none(const u8 *in, size_t in_nbytes,
+ 		in_next += len;
+ 	} while (in_next != in_end);
+ 
++	if (sync_flush) {
++		/* Empty non-final uncompressed block */
++		if (out_end - out_next < 5)
++			return 0;
++		*out_next++ = DEFLATE_BLOCKTYPE_UNCOMPRESSED << 1;
++		put_unaligned_le32(0xFFFF0000, out_next);
++		out_next += 4;
++	}
+ 	return out_next - out;
+ }
+ 
+@@ -4027,10 +4046,10 @@ libdeflate_alloc_compressor(int compression_level)
+ 	return libdeflate_alloc_compressor_ex(compression_level, &defaults);
+ }
+ 
+-LIBDEFLATEAPI size_t
+-libdeflate_deflate_compress(struct libdeflate_compressor *c,
+-			    const void *in, size_t in_nbytes,
+-			    void *out, size_t out_nbytes_avail)
++static size_t
++deflate_compress(struct libdeflate_compressor *c,
++		 const void *in, size_t in_nbytes,
++		 void *out, size_t out_nbytes_avail, bool sync_flush)
+ {
+ 	struct deflate_output_bitstream os;
+ 
+@@ -4040,7 +4059,7 @@ libdeflate_deflate_compress(struct libdeflate_compressor *c,
+ 	 */
+ 	if (unlikely(in_nbytes <= c->max_passthrough_size))
+ 		return deflate_compress_none(in, in_nbytes,
+-					     out, out_nbytes_avail);
++					     out, out_nbytes_avail, sync_flush);
+ 
+ 	/* Initialize the output bitstream structure. */
+ 	os.bitbuf = 0;
+@@ -4048,6 +4067,7 @@ libdeflate_deflate_compress(struct libdeflate_compressor *c,
+ 	os.next = out;
+ 	os.end = os.next + out_nbytes_avail;
+ 	os.overflow = false;
++	os.sync_flush = sync_flush;
+ 
+ 	/* Call the actual compression function. */
+ 	(*c->impl)(c, in, in_nbytes, &os);
+@@ -4056,6 +4076,22 @@ libdeflate_deflate_compress(struct libdeflate_compressor *c,
+ 	if (os.overflow)
+ 		return 0;
+ 
++	if (sync_flush) {
++		/*
++		 * End with an empty non-final uncompressed block, like zlib's
++		 * Z_SYNC_FLUSH: BFINAL=0 and BTYPE=00 (3 zero bits), padding to
++		 * a byte boundary, then LEN=0x0000 and NLEN=0xFFFF.
++		 */
++		ASSERT(os.bitcount <= 7);
++		if (os.end - os.next < DIV_ROUND_UP(os.bitcount + 3, 8) + 4)
++			return 0;
++		*os.next++ = os.bitbuf;
++		if (os.bitcount > 5)
++			*os.next++ = 0;
++		put_unaligned_le32(0xFFFF0000, os.next);
++		return os.next + 4 - (u8 *)out;
++	}
++
+ 	/*
+ 	 * Write the final byte if needed.  This can't overflow the output
+ 	 * buffer because deflate_flush_block() would have set the overflow flag
+@@ -4071,6 +4107,22 @@ libdeflate_deflate_compress(struct libdeflate_compressor *c,
+ 	return os.next - (u8 *)out;
+ }
+ 
++LIBDEFLATEAPI size_t
++libdeflate_deflate_compress(struct libdeflate_compressor *c,
++			    const void *in, size_t in_nbytes,
++			    void *out, size_t out_nbytes_avail)
++{
++	return deflate_compress(c, in, in_nbytes, out, out_nbytes_avail, false);
++}
++
++LIBDEFLATEAPI size_t
++libdeflate_deflate_compress_sync(struct libdeflate_compressor *c,
++				 const void *in, size_t in_nbytes,
++				 void *out, size_t out_nbytes_avail)
++{
++	return deflate_compress(c, in, in_nbytes, out, out_nbytes_avail, true);
++}
++
+ LIBDEFLATEAPI void
+ libdeflate_free_compressor(struct libdeflate_compressor *c)
+ {
+diff --git a/libdeflate.h b/libdeflate.h
+index 1821acd..199089d 100644
+--- a/libdeflate.h
++++ b/libdeflate.h
+@@ -115,6 +115,24 @@ LIBDEFLATEAPI size_t
+ libdeflate_deflate_compress_bound(struct libdeflate_compressor *compressor,
+ 				  size_t in_nbytes);
+ 
++/*
++ * Like libdeflate_deflate_compress(), but instead of a complete DEFLATE stream,
++ * the output is a "sync flushed" piece of one: none of its blocks is marked
++ * final, and it ends with an empty uncompressed block, so it ends on a byte
++ * boundary with the bytes 00 00 FF FF -- like the output of zlib's deflate()
++ * with Z_SYNC_FLUSH.  Thus the outputs of multiple calls can be concatenated
++ * into one stream, which a single zlib inflate stream can decompress piece by
++ * piece.  Each call compresses its input independently of previous calls.
++ * Nothing here ends the stream; for that, append a final block yourself.
++ *
++ * The output size is at most 5 bytes more than
++ * libdeflate_deflate_compress_bound(compressor, in_nbytes).
++ */
++LIBDEFLATEAPI size_t
++libdeflate_deflate_compress_sync(struct libdeflate_compressor *compressor,
++				 const void *in, size_t in_nbytes,
++				 void *out, size_t out_nbytes_avail);
++
+ /*
+  * Like libdeflate_deflate_compress(), but uses the zlib wrapper format instead
+  * of raw DEFLATE.

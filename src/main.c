@@ -2,6 +2,7 @@
 #include "server.h"
 #include "service.h"
 #include "log.h"
+#include "compositor.h"
 
 GMainLoop* loop;
 
@@ -20,7 +21,14 @@ int main (int argc, char** argv) {
 		log_set_level(Debug);
 	}
 
-	server_t server;
+	// libjpeg-turbo detects NEON support by looking for "neon" in
+	// /proc/cpuinfo, which 64-bit kernels don't report for 32-bit processes
+	// - this makes JPEG encoding (tight encoding) a few times slower.
+	if (cpu_has_neon()) {
+		setenv("JSIMD_FORCENEON", "1", 0);
+	}
+
+	server_t server = {0};
 	server.active_clients = 0;
 	server.running = false;
 
@@ -31,6 +39,7 @@ int main (int argc, char** argv) {
 	settings.width = 1920/2;
 	settings.height = 1080/2;
 	settings.password = strdup("password");
+	settings.video_capture = true;
 
 	INFO("Config load result: %d", settings_load_file(&settings, SETTINGS_PERSISTENCE_PATH));
 

@@ -1,0 +1,14 @@
+Log all encodings supported by clients (rfbLog, debug only)
+
+--- a/libvncserver/rfbserver.c
++++ b/libvncserver/rfbserver.c
+@@ -2330,6 +2330,9 @@
+             }
+             enc = Swap32IfLE(enc);
+ 
++            rfbLog("Client %s supports encoding %s (%d)\n", cl->host,
++                   encodingName(enc, encBuf, sizeof(encBuf)), (int)enc);
++
+             switch (enc) {
+ 
+             case rfbEncodingCopyRect:

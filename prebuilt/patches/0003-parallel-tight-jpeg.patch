@@ -1,0 +1,374 @@
+Parallel Tight JPEG compression
+
+JPEG subrectangles don't depend on any encoder state (other Tight
+subencodings use persistent zlib streams), so while a large rectangle is
+being encoded, they are queued and compressed by worker threads instead,
+and sent as soon as they're done. Solid, mono and indexed subrectangles are
+still encoded in order by the client thread. Rectangles of an update can be
+sent in any order, so the encoded stream stays valid.
+
+--- a/libvncserver/tight.c
++++ b/libvncserver/tight.c
+@@ -37,6 +37,7 @@
+ 
+ #include <rfb/rfb.h>
+ #include "private.h"
++#include <pthread.h>
+ 
+ #ifdef LIBVNCSERVER_HAVE_LIBPNG
+ #include <png.h>
+@@ -152,6 +153,44 @@ static TLS char *tightAfterBuf = NULL;
+ 
+ static TLS tjhandle j = NULL;
+ 
++/*
++ * Parallel JPEG compression. JPEG subrectangles don't depend on any encoder
++ * state (unlike the other subencodings, which use persistent zlib streams),
++ * so while a large rectangle is being encoded they are queued and compressed
++ * by worker threads, and sent as soon as they are done. Rectangles of an
++ * update can be sent in any order.
++ */
++#define TIGHT_JPEG_THREADS 3
++/* Rectangles smaller than this are compressed by the client thread itself */
++#define TIGHT_JPEG_MIN_PARALLEL_SIZE (2 * 65536)
++
++typedef struct {
++    int x, y, w, h;
++    int quality, subsamp;
++    unsigned char *data;
++    unsigned long size;
++    /* 0 - pending, 1 - compressed, -1 - failed */
++    int state;
++} rfbTightJpegRect;
++
++typedef struct {
++    const unsigned char *fb;
++    int pitch, ps, flags;
++    rfbTightJpegRect *rects;
++    int nRects, maxRects;
++    int nextRect;   /* next rectangle to be compressed by a worker */
++    int nextSend;   /* next rectangle to be sent by the client thread */
++    rfbBool finished;
++    rfbBool failed;
++    pthread_mutex_t mutex;
++    pthread_cond_t cond;
++    pthread_t threads[TIGHT_JPEG_THREADS];
++    int nThreads;
++} rfbTightJpegBatch;
++
++/* Batch of the rectangle currently being encoded by this thread, if any */
++static TLS rfbTightJpegBatch *jpegBatch = NULL;
++
+ void rfbTightCleanup (rfbScreenInfoPtr screen)
+ {
+     if (tightBeforeBufSize) {
+@@ -224,6 +263,10 @@ static void EncodeMonoRect32 (uint8_t *buf, int w, int h);
+ 
+ static rfbBool SendJpegRect (rfbClientPtr cl, int x, int y, int w, int h,
+                              int quality);
++static rfbBool SendJpegSubrect (rfbClientPtr cl, int x, int y, int w, int h,
++                                int quality);
++static rfbTightJpegBatch *JpegBatchStart (rfbClientPtr cl);
++static rfbBool JpegBatchFinish (rfbClientPtr cl, rfbBool success);
+ static void PrepareRowForImg(rfbClientPtr cl, uint8_t *dst, int x, int y, int count);
+ static void PrepareRowForImg24(rfbClientPtr cl, uint8_t *dst, int x, int y, int count);
+ static void PrepareRowForImg16(rfbClientPtr cl, uint8_t *dst, int x, int y, int count);
+@@ -273,8 +316,20 @@ rfbSendRectEncodingTight(rfbClientPtr cl,
+                          int w,
+                          int h)
+ {
++    rfbBool success;
++
+     cl->tightEncoding = rfbEncodingTight;
+-    return SendRectEncodingTight(cl, x, y, w, h);
++
++    if (jpegBatch == NULL && cl->turboQualityLevel != -1 &&
++        w * h >= TIGHT_JPEG_MIN_PARALLEL_SIZE)
++        jpegBatch = JpegBatchStart(cl);
++
++    success = SendRectEncodingTight(cl, x, y, w, h);
++
++    if (jpegBatch != NULL)
++        success = JpegBatchFinish(cl, success);
++
++    return success;
+ }
+ 
+ rfbBool
+@@ -700,15 +755,12 @@ SendSubrect(rfbClientPtr cl,
+             return FALSE;
+     }
+ 
+-    if (!rfbSendTightHeader(cl, x, y, w, h))
+-        return FALSE;
+-
+     fbptr = (cl->scaledScreen->frameBuffer
+              + (cl->scaledScreen->paddedWidthInBytes * y)
+              + (x * (cl->scaledScreen->bitsPerPixel / 8)));
+ 
+     if (subsampLevel == TJ_GRAYSCALE && qualityLevel != -1)
+-        return SendJpegRect(cl, x, y, w, h, qualityLevel);
++        return SendJpegSubrect(cl, x, y, w, h, qualityLevel);
+ 
+     paletteMaxColors = w * h / tightConf[compressLevel].idxMaxColorsDivisor;
+     if(qualityLevel != -1)
+@@ -760,14 +812,16 @@ SendSubrect(rfbClientPtr cl,
+         }
+     }
+ 
++    if (paletteNumColors == 0 && qualityLevel != -1)
++        return SendJpegSubrect(cl, x, y, w, h, qualityLevel);
++
++    if (!rfbSendTightHeader(cl, x, y, w, h))
++        return FALSE;
++
+     switch (paletteNumColors) {
+     case 0:
+         /* Truecolor image */
+-        if (qualityLevel != -1) {
+-            success = SendJpegRect(cl, x, y, w, h, qualityLevel);
+-        } else {
+-            success = SendFullColorRect(cl, x, y, w, h);
+-        }
++        success = SendFullColorRect(cl, x, y, w, h);
+         break;
+     case 1:
+         /* Solid rectangle */
+@@ -1688,6 +1742,237 @@ SendJpegRect(rfbClientPtr cl, int x, int y, int w, int h, int quality)
+     return rfbSendCompressedDataTight(cl, tightAfterBuf, (int)size);
+ }
+ 
++static void *
++JpegWorker(void *arg)
++{
++    rfbTightJpegBatch *batch = (rfbTightJpegBatch *)arg;
++    tjhandle handle = tjInitCompress();
++    unsigned char *buf = NULL;
++    unsigned long bufSize = 0;
++
++    pthread_mutex_lock(&batch->mutex);
++    for (;;) {
++        rfbTightJpegRect rect;
++        unsigned char *data = NULL;
++        unsigned long size = 0;
++        rfbBool ok;
++        int i;
++
++        while (!batch->failed && !batch->finished
++               && batch->nextRect >= batch->nRects)
++            pthread_cond_wait(&batch->cond, &batch->mutex);
++        if (batch->failed || batch->nextRect >= batch->nRects)
++            break;
++        i = batch->nextRect++;
++        rect = batch->rects[i];
++        pthread_mutex_unlock(&batch->mutex);
++
++        ok = handle != NULL;
++        if (ok && bufSize < TJBUFSIZE(rect.w, rect.h)) {
++            free(buf);
++            bufSize = TJBUFSIZE(rect.w, rect.h);
++            ok = (buf = (unsigned char *)malloc(bufSize)) != NULL;
++            if (!ok)
++                bufSize = 0;
++        }
++        if (ok)
++            ok = tjCompress(handle, (unsigned char *)batch->fb
++                            + rect.y * batch->pitch + rect.x * batch->ps,
++                            rect.w, batch->pitch, rect.h, batch->ps, buf,
++                            &size, rect.subsamp, rect.quality,
++                            batch->flags) != -1;
++        if (!ok)
++            rfbLog("JPEG Error: %s\n", handle ? tjGetErrorStr() : "tjInitCompress failed");
++        /* Compressed data is usually much smaller than the worst case */
++        if (ok && (data = (unsigned char *)malloc(size)) != NULL)
++            memcpy(data, buf, size);
++
++        pthread_mutex_lock(&batch->mutex);
++        batch->rects[i].data = data;
++        batch->rects[i].size = size;
++        batch->rects[i].state = data ? 1 : -1;
++        if (!data)
++            batch->failed = TRUE;
++        pthread_cond_broadcast(&batch->cond);
++    }
++    pthread_cond_broadcast(&batch->cond);
++    pthread_mutex_unlock(&batch->mutex);
++
++    if (handle)
++        tjDestroy(handle);
++    free(buf);
++
++    return NULL;
++}
++
++static rfbTightJpegBatch *
++JpegBatchStart(rfbClientPtr cl)
++{
++    rfbTightJpegBatch *batch;
++    rfbPixelFormat *fmt = &cl->screen->serverFormat;
++
++    /* Other pixel formats need conversion before compression */
++    if (fmt->bitsPerPixel != 32 || cl->scaledScreen->bitsPerPixel != 32)
++        return NULL;
++
++    batch = (rfbTightJpegBatch *)calloc(1, sizeof(rfbTightJpegBatch));
++    if (!batch)
++        return NULL;
++
++    batch->fb = (const unsigned char *)cl->scaledScreen->frameBuffer;
++    batch->pitch = cl->scaledScreen->paddedWidthInBytes;
++    batch->ps = 4;
++    if (fmt->bigEndian)
++        batch->flags |= TJ_ALPHAFIRST;
++    if (fmt->redShift == 16 && fmt->blueShift == 0)
++        batch->flags |= TJ_BGR;
++    if (fmt->bigEndian)
++        batch->flags ^= TJ_BGR;
++
++    pthread_mutex_init(&batch->mutex, NULL);
++    pthread_cond_init(&batch->cond, NULL);
++
++    return batch;
++}
++
++/* Sends compressed JPEG rectangles in order, optionally waiting for all */
++static rfbBool
++JpegBatchSend(rfbClientPtr cl, rfbBool wait)
++{
++    rfbTightJpegBatch *batch = jpegBatch;
++
++    for (;;) {
++        rfbTightJpegRect rect;
++        rfbBool ok;
++
++        pthread_mutex_lock(&batch->mutex);
++        while (wait && !batch->failed && batch->nextSend < batch->nRects
++               && batch->rects[batch->nextSend].state == 0)
++            pthread_cond_wait(&batch->cond, &batch->mutex);
++        if (batch->failed) {
++            pthread_mutex_unlock(&batch->mutex);
++            return FALSE;
++        }
++        if (batch->nextSend >= batch->nRects
++            || batch->rects[batch->nextSend].state == 0) {
++            pthread_mutex_unlock(&batch->mutex);
++            return TRUE;
++        }
++        rect = batch->rects[batch->nextSend];
++        batch->rects[batch->nextSend].data = NULL;
++        batch->nextSend++;
++        pthread_mutex_unlock(&batch->mutex);
++
++        ok = rfbSendTightHeader(cl, rect.x, rect.y, rect.w, rect.h);
++        if (ok && cl->ublen + TIGHT_MIN_TO_COMPRESS + 1 > UPDATE_BUF_SIZE)
++            ok = rfbSendUpdateBuf(cl);
++        if (ok) {
++            cl->updateBuf[cl->ublen++] = (char)(rfbTightJpeg << 4);
++            rfbStatRecordEncodingSentAdd(cl, cl->tightEncoding, 1);
++            ok = rfbSendCompressedDataTight(cl, (char *)rect.data, (int)rect.size);
++        }
++        free(rect.data);
++
++        if (!ok) {
++            pthread_mutex_lock(&batch->mutex);
++            batch->failed = TRUE;
++            pthread_cond_broadcast(&batch->cond);
++            pthread_mutex_unlock(&batch->mutex);
++            return FALSE;
++        }
++    }
++}
++
++static rfbBool
++JpegBatchQueue(rfbClientPtr cl, int x, int y, int w, int h, int quality)
++{
++    rfbTightJpegBatch *batch = jpegBatch;
++    rfbTightJpegRect *rect;
++
++    pthread_mutex_lock(&batch->mutex);
++    if (batch->nRects == batch->maxRects) {
++        int maxRects = batch->maxRects ? batch->maxRects * 2 : 64;
++        rfbTightJpegRect *rects = (rfbTightJpegRect *)realloc(batch->rects,
++            maxRects * sizeof(rfbTightJpegRect));
++        if (!rects) {
++            pthread_mutex_unlock(&batch->mutex);
++            return FALSE;
++        }
++        batch->rects = rects;
++        batch->maxRects = maxRects;
++    }
++    rect = &batch->rects[batch->nRects++];
++    memset(rect, 0, sizeof(*rect));
++    rect->x = x;
++    rect->y = y;
++    rect->w = w;
++    rect->h = h;
++    rect->quality = quality;
++    rect->subsamp = subsampLevel2tjsubsamp[subsampLevel];
++
++    /* Start workers as needed */
++    if (batch->nThreads < TIGHT_JPEG_THREADS
++        && batch->nThreads < batch->nRects - batch->nextRect
++        && pthread_create(&batch->threads[batch->nThreads], NULL, JpegWorker, batch) == 0)
++        batch->nThreads++;
++
++    pthread_cond_broadcast(&batch->cond);
++    pthread_mutex_unlock(&batch->mutex);
++
++    if (batch->nThreads == 0) {
++        rfbLog("SendJpegSubrect: failed to start compression threads\n");
++        return FALSE;
++    }
++
++    /* Send whatever is ready in the meantime */
++    return JpegBatchSend(cl, FALSE);
++}
++
++static rfbBool
++JpegBatchFinish(rfbClientPtr cl, rfbBool success)
++{
++    rfbTightJpegBatch *batch = jpegBatch;
++    int i;
++
++    pthread_mutex_lock(&batch->mutex);
++    batch->finished = TRUE;
++    if (!success)
++        batch->failed = TRUE;
++    pthread_cond_broadcast(&batch->cond);
++    pthread_mutex_unlock(&batch->mutex);
++
++    if (success)
++        success = JpegBatchSend(cl, TRUE);
++
++    for (i = 0; i < batch->nThreads; i++)
++        pthread_join(batch->threads[i], NULL);
++
++    /* Rectangles not sent due to a failure */
++    for (i = 0; i < batch->nRects; i++)
++        free(batch->rects[i].data);
++
++    pthread_mutex_destroy(&batch->mutex);
++    pthread_cond_destroy(&batch->cond);
++    free(batch->rects);
++    free(batch);
++    jpegBatch = NULL;
++
++    return success;
++}
++
++/* Sends JPEG subrectangle, or queues it for parallel compression */
++static rfbBool
++SendJpegSubrect(rfbClientPtr cl, int x, int y, int w, int h, int quality)
++{
++    if (jpegBatch != NULL)
++        return JpegBatchQueue(cl, x, y, w, h, quality);
++
++    if (!rfbSendTightHeader(cl, x, y, w, h))
++        return FALSE;
++
++    return SendJpegRect(cl, x, y, w, h, quality);
++}
++
+ static void
+ PrepareRowForImg(rfbClientPtr cl,
+                   uint8_t *dst,
